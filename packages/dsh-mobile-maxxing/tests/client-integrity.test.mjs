@@ -772,3 +772,33 @@ test("the workspace picker caps its list and keeps Add workspace outside it", ()
 		assert.ok(rules.some((entry) => entry.head === head), `${head} is missing from the mobile sheet`);
 	}
 });
+
+test("the phone drawer defers to a host that runs its own smartphone drawer", () => {
+	// Newer DSH hosts paint `data-dsh-mobile-layout="smartphone"` and draw
+	// their own toggle and backdrop. That layout never writes
+	// `data-sidebar-collapsed`, so the rail state would read "open" forever and
+	// the two drawers would pile up: this module must follow the host instead.
+	assert.match(CLIENT, /function hostsOwnDrawer\(\) \{[^}]*data-dsh-mobile-layout/, "the host drawer is not detected");
+	assert.match(CLIENT, /data-dsh-mobile-drawer"\) === "open"/, "the host drawer state is not followed");
+	assert.match(CLIENT, /setAttribute\("data-rdsh-host-drawer", ""\)/, "the deferral is not published for the stylesheet");
+	assert.match(CLIENT, /html\[data-rdsh-host-drawer\] \.rdsh-mux-fab \{ display: none !important; \}/, "the plugin button is not retired under the host drawer");
+	assert.match(CLIENT, /html\[data-rdsh-host-drawer\] \.rdsh-mux-backdrop \{ display: none !important; \}/, "the plugin backdrop is not retired under the host drawer");
+});
+
+test("the drawer closes on the touch, before the app's own outside-press handling", () => {
+	// The app frame already closes its panel on a press outside it, and its
+	// pointerdown listener runs before any click. A backdrop that only waited
+	// for the click found the frame already closed (or the element that slid
+	// into place) and left the sheet on screen.
+	assert.match(CLIENT, /backdrop.addEventListener\("pointerdown", \(event\) => \{/, "the backdrop does not react to a touch");
+	assert.match(CLIENT, /backdrop.addEventListener\("pointerup", release, \{ once: true \}\);/, "the touch never completes into a close");
+	assert.match(CLIENT, /backdrop.addEventListener\("pointercancel", cancel, \{ once: true \}\);/, "a cancelled press still closes the drawer");
+});
+
+test("a focused field is never smaller than the 16px iOS zoom threshold", () => {
+	assert.match(CLIENT, /-webkit-text-size-adjust: 100% !important;/, "text inflation is not pinned");
+	assert.match(CLIENT, /\[data-composer-card\] \[contenteditable\] \{[\s\S]{0,120}font-size: 16px !important;/, "the composer editor is not pinned to 16px");
+	assert.match(CLIENT, /function releaseFocusZoom\(\)/, "a latched focus zoom is never released");
+	assert.match(CLIENT, /visualViewport\?\.addEventListener\("resize", onFocusZoom\)/, "the focus zoom is not watched on resize");
+	assert.match(CLIENT, /visualViewport\?\.addEventListener\("scroll", onFocusZoom\)/, "the focus zoom is not watched on scroll");
+});

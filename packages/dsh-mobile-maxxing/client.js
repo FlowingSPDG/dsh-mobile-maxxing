@@ -2273,6 +2273,27 @@ html[data-rdsh-device-mode="mobile"] .dsh-mobile-maxxing-install-actions { displ
       return CONFIG.showHiddenControls === true;
     }
 
+    /**
+     * Does the host already run a phone drawer of its own?
+     *
+     * `@deepseek-ai/dsh-client-ui-mobile` paints `data-dsh-mobile-layout`
+     * onto the document and gives the session list its own way in (the header
+     * toggle), its own way out (`data-dsh-mobile-drawer-backdrop`) and its own
+     * open/closed state (`data-dsh-mobile-drawer`). It also keeps the frame's
+     * `data-sidebar-collapsed` unset for the whole phone session, so the rail
+     * state this module reads below says "open" no matter what the user did.
+     *
+     * The two drawers cannot share the screen: upstream's toggle is the one the
+     * header shows, upstream's backdrop covers the screen, and this module's
+     * own button would be hidden underneath them. Where the host owns the
+     * drawer, this module follows its state and injects nothing.
+     */
+    function hostsOwnDrawer() {
+      // The layout attribute is written by that package's presenter for the
+      // whole smartphone session, and removed on dispose or on a desktop.
+      return document.documentElement.getAttribute("data-dsh-mobile-layout") === "smartphone";
+    }
+
     // ---------------------------------------------------------------------
     // Decoration: live DOM → stable hooks
     // ---------------------------------------------------------------------
@@ -2666,6 +2687,7 @@ html[data-rdsh-device-mode="mobile"] .dsh-mobile-maxxing-install-actions { displ
       clearComposerHooks();
       clearTypingAnimations();
       removeRouteBack();
+      settleDrawer();
       removeDrawerNodes();
       // Inline styles this module wrote onto upstream nodes.
       clearQueueDockHooks();
@@ -4449,6 +4471,42 @@ html[data-rdsh-device-mode="mobile"] .dsh-mobile-maxxing-install-actions { displ
       if (meta.getAttribute("content") !== content) meta.setAttribute("content", content);
     }
 
+    /**
+     * Undo a focus zoom that is already on screen.
+     *
+     * The 16px rule below is supposed to stop iOS from zooming the composer.
+     * It does not always: a field rendered by a layout that slipped under 16px
+     * (a smaller display font, a panel that re-inline-sizes it) zooms on focus,
+     * and WebKit keeps that zoom for the rest of the document — the page then
+     * looks thrown to another corner and stays there after the keyboard
+     * closes. The viewport meta is no help either: iOS ignores
+     * `maximum-scale` / `user-scalable` in Safari.
+     *
+     * What is left is to notice the zoom and put it back. A magnified page
+     * reports a visual viewport narrower than its layout viewport (a keyboard
+     * only ever shrinks the height), and the published scale is then above 1.
+     * Bring the field to the centre of the screen instead of letting the
+     * browser scroll it off to one side: with the reset blocked, that at least
+     * leaves the user looking at what they are typing.
+     */
+    function releaseFocusZoom() {
+      const view = window.visualViewport;
+      if (view === null || view === undefined || !(view.width > 0)) return;
+      const zoomed = view.width < window.innerWidth - 1 || (typeof view.scale === "number" && view.scale > 1.02);
+      document.documentElement.toggleAttribute("data-rdsh-focus-zoom", zoomed);
+      if (!zoomed) return;
+      const field = document.activeElement;
+      if (field === null || field === undefined || typeof field.scrollIntoView !== "function") return;
+      if (field.closest('[contenteditable="true"], input, textarea') === null) return;
+      try {
+        // `nearest` would leave a field the zoom pushed out of view where it
+        // is; centring is the point of this call.
+        field.scrollIntoView({ block: "center", inline: "nearest", behavior: "auto" });
+      } catch {
+        /* an engine without options still gets the no-zoom default */
+      }
+    }
+
     const ACTIVITY_ICONS = {
       shell: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.7" y="2.7" width="12.6" height="10.6" rx="2"/><path d="M4.4 6.2l2.3 1.8-2.3 1.8"/><path d="M8.4 10.2h3.3"/></svg>',
       subagent: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="4.6" r="2.1"/><path d="M3.6 13.4c0-2.6 2-4.4 4.4-4.4s4.4 1.8 4.4 4.4"/><path d="M11.6 3.2a2.2 2.2 0 0 1 0 3.9"/></svg>',
@@ -4981,11 +5039,33 @@ html[data-rdsh-device-mode="mobile"] .dsh-mobile-maxxing-install-actions { displ
             else if (cls.includes("_rightbarCol")) child.setAttribute("data-rdsh-rightbar-col", "");
           }
           const sidebar = document.querySelector('[data-slot="sidebar"]');
-          if (sidebar && sidebar.parentElement) sidebar.parentElement.setAttribute("data-rdsh-sidebar", "");
-          const open = !root.hasAttribute("data-sidebar-collapsed");
-          if (open !== state.drawerOpen) emit({ drawerOpen: open });
-          document.documentElement.setAttribute("data-rdsh-drawer", open ? "open" : "closed");
+          // Newer hosts run their own smartphone drawer (the `ui-mobile`
+          // package: its toggle in the header, its backdrop in the shell
+          // overlay, its own `data-dsh-mobile-*` state). When that is the case
+          // this plugin must not compete with it: upstream already draws the
+          // way in and the way out, and it never writes `data-sidebar-collapsed`
+          // on a phone, so the rail state below would read "open" forever and
+          // both drawers would sit on top of each other.
+          if (hostsOwnDrawer()) {
+            settleDrawer();
+            const open = document.documentElement.getAttribute("data-dsh-mobile-drawer") === "open";
+            if (open !== state.drawerOpen) emit({ drawerOpen: open });
+            document.documentElement.setAttribute("data-rdsh-drawer", open ? "open" : "closed");
+            document.documentElement.setAttribute("data-rdsh-host-drawer", "");
+          } else {
+            document.documentElement.removeAttribute("data-rdsh-host-drawer");
+            // The drawer is the layout's own node (SidebarRoot), and it has to
+            // leave the layout before it can be a sheet over it: fix it in the
+            // column instead and the column keeps its row, so the chat header
+            // picks up the list's width and the drawer covers the whole screen.
+            liftDrawer(root, sidebar);
+            const open = !root.hasAttribute("data-sidebar-collapsed");
+            if (open !== state.drawerOpen) emit({ drawerOpen: open });
+            document.documentElement.setAttribute("data-rdsh-drawer", open ? "open" : "closed");
+          }
         } else {
+          settleDrawer();
+          document.documentElement.removeAttribute("data-rdsh-host-drawer");
           for (const attribute of ["data-rdsh-frame", "data-rdsh-center-col", "data-rdsh-rightbar-col", "data-rdsh-sidebar", "data-rdsh-drawer"]) {
             clearOwnedAttribute(attribute);
           }
@@ -5149,6 +5229,134 @@ html[data-rdsh-device-mode="mobile"] .dsh-mobile-maxxing-install-actions { displ
     let fab = null;
     let backdrop = null;
 
+    /** The drawer node this module lifted out of the layout, and where it was. */
+    let drawerLayer = null;
+    let drawerOrigin = null;
+
+    /**
+     * Move the session list out of the layout and onto its own overlay.
+     *
+     * The phone drawer has to own the whole screen for the duration of the
+     * swipe: the list is what the drawer is, and the chat behind it must not
+     * reflow while the sheet is open. A `position: fixed` on the list alone
+     * does not do that — a fixed box leaves its flow slot behind, so in the
+     * app frame (`[data-app-frame]`, a grid whose first track is the sidebar
+     * column) the chat header stays as narrow as the list was and the dimmed
+     * strip is only as wide as the chat. The list is therefore re-parented
+     * into a layer that is a child of the frame itself, outside every column,
+     * with the slot's anchor left behind so the layout still finds a box in
+     * the place it expects.
+     *
+     * The original parent and sibling are kept: `settleDrawer` puts the node
+     * back on dispose, on a desktop boot and as soon as the app re-renders the
+     * slot (React would otherwise throw on a child that moved).
+     */
+    function liftDrawer(root, sidebar) {
+      if (sidebar === null || sidebar === undefined || sidebar.parentElement === null) {
+        settleDrawer();
+        return;
+      }
+      // The slot renders `[data-slot="sidebar"]` with `display: contents`; the
+      // layout's own node inside it is what has to move, but that node is not
+      // always the box the app paints (here the column wrapper is). The sheet
+      // is therefore the outermost element the slot owns that has a box of its
+      // own: walk down through single-child wrappers and stop before the
+      // list's own rows.
+      let drawer = sidebar;
+      while (drawer.children.length === 1 && drawer.firstElementChild !== null
+        && !drawer.hasAttribute("data-row-key") && !drawer.hasAttribute("role")) {
+        const child = drawer.firstElementChild;
+        if (typeof child.getBoundingClientRect !== "function") break;
+        if (child.hasAttribute("data-row-key") || child.hasAttribute("role")) break;
+        drawer = child;
+      }
+      // A subtree the app has since painted somewhere else is not the drawer:
+      // in the live layout the plugin's own theme presentation keeps a second
+      // copy of the app chrome around for the first paint, and lifting that
+      // one would freeze the drawer while the real list sat unmoved. Only a
+      // visibly laid-out subtree is taken.
+      if (typeof drawer.getBoundingClientRect === "function") {
+        const box = drawer.getBoundingClientRect();
+        if (!(box.width > 0) || !(box.height > 0)) {
+          if (drawerLayer !== null) settleDrawer();
+          return;
+        }
+      }
+      if (typeof drawer.setAttribute !== "function" || typeof drawer.append !== "function") {
+        if (drawerLayer !== null) settleDrawer();
+        return;
+      }
+      // A full-screen route keeps its own copy of the app chrome mounted at
+      // 0x0; lifting that one would drag the wrong tree onto the screen.
+      if (typeof root.getBoundingClientRect === "function") {
+        const box = root.getBoundingClientRect();
+        if (!(box.width > 0) || !(box.height > 0)) return;
+      }
+      if (typeof root.append !== "function" || typeof drawer.append !== "function") return;
+      if (drawerLayer === null) {
+        const parent = drawer.parentElement;
+        const layer = document.createElement("div");
+        layer.className = "rdsh-mux-drawer-layer";
+        layer.setAttribute("data-rdsh-drawer-layer", "");
+        root.append(layer);
+        if (parent !== null && typeof parent.setAttribute === "function") parent.setAttribute("data-rdsh-sidebar-host", "");
+        drawerLayer = layer;
+        drawerOrigin = { parent, sibling: drawer.nextSibling ?? null };
+        drawer.setAttribute("data-rdsh-sidebar", "");
+        layer.append(drawer);
+        return;
+      }
+      if (drawerLayer.parentElement !== root) root.append(drawerLayer);
+      if (drawer.parentElement !== drawerLayer) {
+        // The app re-rendered the slot (or re-created it under a new node):
+        // the node our layer holds is stale, and React owns it. Send it home
+        // before the layout is asked to reconcile a child that moved.
+        const stale = drawerLayer.firstElementChild;
+        if (stale !== null && stale !== drawer && drawerOrigin !== null) {
+          stale.removeAttribute("data-rdsh-sidebar");
+          const { parent, sibling } = drawerOrigin;
+          const anchor = sibling !== null && sibling.isConnected === true && sibling.parentElement === parent ? sibling : null;
+          if (parent !== null && typeof parent.append === "function") {
+            if (anchor !== null) anchor.after(stale);
+            else parent.append(stale);
+          } else {
+            stale.remove();
+          }
+        }
+        drawer.setAttribute("data-rdsh-sidebar", "");
+        drawerLayer.append(drawer);
+      }
+    }
+
+    /**
+     * Put the lifted drawer back into the layout.
+     *
+     * Safe when nothing moved, and safe to call more than once: the node goes
+     * back to the exact parent and next sibling it was taken from.
+     */
+    function settleDrawer() {
+      const layer = drawerLayer;
+      const origin = drawerOrigin;
+      drawerLayer = null;
+      drawerOrigin = null;
+      if (layer === null) return;
+      const drawer = layer.firstElementChild;
+      if (drawer !== null) {
+        drawer.removeAttribute("data-rdsh-sidebar");
+        if (origin !== null && origin.parent !== null && typeof origin.parent.append === "function") {
+          const anchor = origin.sibling !== null && origin.sibling.isConnected === true && origin.sibling.parentElement === origin.parent
+            ? origin.sibling
+            : null;
+          if (anchor !== null) anchor.after(drawer);
+          else origin.parent.append(drawer);
+        } else {
+          drawer.remove();
+        }
+      }
+      if (layer.parentElement !== null) layer.remove();
+      for (const host of document.querySelectorAll("[data-rdsh-sidebar-host]")) host.removeAttribute("data-rdsh-sidebar-host");
+    }
+
     function toggleDrawer() {
       const button = document.querySelector('[aria-label="Open sidebar"], [aria-label="Collapse sidebar"]');
       if (button !== null) button.click();
@@ -5281,6 +5489,29 @@ html[data-rdsh-device-mode="mobile"] .dsh-mobile-maxxing-install-actions { displ
       backdrop = document.createElement("div");
       backdrop.className = "rdsh-mux-backdrop";
       backdrop.setAttribute("aria-hidden", "true");
+      // Why a touch and not the click: the app frame already owns "a press
+      // outside the panel closes it", and on a touch its pointerdown listener
+      // runs before any click. Pressing the uncovered strip therefore collapses
+      // the frame first, and the click that follows a moment later would find
+      // a frame that is already closed — or worse, the element that slid into
+      // the finger's place — and do nothing. Closing on the touch itself keeps
+      // the intent: one tap on the uncovered screen dismisses the sheet.
+      backdrop.addEventListener("pointerdown", (event) => {
+        if (event.isPrimary === false) return;
+        // The release decides: a press that turned into a scroll or a swipe
+        // fires pointercancel instead and leaves the sheet where it is.
+        const release = () => {
+          backdrop.removeEventListener("pointerup", release);
+          backdrop.removeEventListener("pointercancel", cancel);
+          closeDrawer();
+        };
+        const cancel = () => {
+          backdrop.removeEventListener("pointerup", release);
+          backdrop.removeEventListener("pointercancel", cancel);
+        };
+        backdrop.addEventListener("pointerup", release, { once: true });
+        backdrop.addEventListener("pointercancel", cancel, { once: true });
+      });
       backdrop.addEventListener("click", closeDrawer);
 
       document.body.append(backdrop, fab);
@@ -10094,6 +10325,11 @@ html[data-rdsh-anim="none"] [data-rdsh-running] [data-rdsh-session-title]::after
   [data-rdsh-frame] [data-rdsh-center-col] { grid-column: 2 !important; }
   [data-rdsh-frame] [data-rdsh-rightbar-col] { grid-column: 3 !important; }
   [data-rdsh-frame][data-rightbar-fullscreen] { grid-template-columns: 0 minmax(0, 1fr) 0 !important; }
+  /* The session list is the slot's own node, and the plugin moves THAT node
+     into an overlay layer it creates inside the app frame (see liftDrawer).
+     Taking it out of the grid is what frees the one column the chat needs;
+     the old in-column fixed positioning is kept for a node that is still in
+     place (a frame without the app-frame marker, an app that re-renders it). */
   [data-rdsh-sidebar] {
     position: fixed !important; inset: 0 auto 0 0 !important;
     box-sizing: border-box;
@@ -10104,23 +10340,53 @@ html[data-rdsh-anim="none"] [data-rdsh-running] [data-rdsh-session-title]::after
     padding-left: env(safe-area-inset-left, 0px);
     padding-right: env(safe-area-inset-right, 0px);
     width: 280px !important; max-width: 86vw; height: 100dvh !important; min-height: 100dvh;
-    z-index: 50; overflow: hidden;
+    /* Above the app's own overlay layer (z-index 20) and every panel a plugin
+       can mount there. */
+    z-index: 60; overflow: hidden;
     transform: translateX(-104%);
     transition: transform var(--rdsh-slide-ms) var(--rdsh-slide-ease), box-shadow var(--rdsh-slide-ms) var(--rdsh-slide-ease);
     will-change: transform; background: var(--dsw-alias-bg-base, #1b1b1d);
   }
+  /* The lifted drawer is anchored to the viewport, not to whatever box the
+     layout slot happened to have: it is a sheet, not a column. */
+  [data-rdsh-drawer-layer] {
+    position: fixed !important; inset: 0 auto 0 0 !important;
+    left: 0; top: 0; bottom: 0;
+    box-sizing: border-box;
+    max-width: 86vw; height: 100dvh; min-height: 0 !important;
+    z-index: 60; overflow: hidden;
+    transform: translateX(-104%);
+    transition: transform var(--rdsh-slide-ms) var(--rdsh-slide-ease), box-shadow var(--rdsh-slide-ms) var(--rdsh-slide-ease);
+    will-change: transform;
+    background: var(--dsw-alias-bg-base, #1b1b1d);
+    pointer-events: auto;
+  }
+  /* The slot's own anchor is a display:contents wrapper, and the drawer that
+     replaces it would otherwise inherit that from the wrapper it came out of
+     (a slot keeps its data-slot attribute). The lift re-tags whatever the app
+     renders, so this rule decides how that box is painted. */
+  [data-rdsh-sidebar] { display: block !important; }
+  /* The chat keeps the width the drawer used to take and never moves; a
+     drawer that a layout re-renders still must not squeeze it. */
+  [data-rdsh-sidebar-host] { width: 0 !important; min-width: 0 !important; padding: 0 !important; border: 0 !important; overflow: visible !important; }
   /* The drop shadow lifts the drawer off the chat. It was removed once as the
      suspected "dark thing sliding in from the left"; the real cause was the
      chat column collapsing to 0px, which let an empty 390px column cover the
      screen. With that fixed the shadow is safe, and the dimmed backdrop keeps
      it from being the only separation. */
-  html[data-rdsh-drawer="open"] [data-rdsh-sidebar] {
+  html[data-rdsh-drawer="open"] [data-rdsh-sidebar],
+  html[data-rdsh-drawer="open"] [data-rdsh-drawer-layer] {
     transform: translateX(0);
     box-shadow: 24px 0 56px rgba(0,0,0,.5);
   }
   html[data-rdsh-drawer="open"] .rdsh-mux-backdrop { display: block; opacity: 1; pointer-events: auto; }
   .rdsh-mux-fab { display: flex; }
   html[data-rdsh-drawer="open"] .rdsh-mux-fab { display: none; }
+  /* Where the host draws the phone drawer itself (its own header toggle and
+     backdrop), this module's button and dimming have nothing left to do: it
+     would sit on the header's toggle and dim under the host's own sheet. */
+  html[data-rdsh-host-drawer] .rdsh-mux-fab { display: none !important; }
+  html[data-rdsh-host-drawer] .rdsh-mux-backdrop { display: none !important; }
 
   /* The drawer's own header toggle is the app's icon button, not a dialog
      close. The reference paints it label-primary in every pointer state and
@@ -10737,12 +11003,30 @@ html[data-rdsh-anim="none"] [data-rdsh-running] [data-rdsh-session-title]::after
   [data-rdsh-question-card] [class*="_title"],
   [data-rdsh-question-card] [class*="_description"] { overflow-wrap: anywhere; }
 
-  /* iOS zooms any focused field below 16px; this is a PWA and needs no zoom. */
+  /* iOS zooms any focused field below 16px; this is a PWA and needs no zoom.
+     The width-based text inflation is the second half of the same problem: it
+     enlarges the text in landscape, which changes the effect size iOS measures
+     on focus, so a 16px field on a wide phone can still zoom. Both are pinned
+     for every field this surface can focus, including the ones the upstream
+     composer styles itself (the contenteditable carries no font-size of its
+     own; it inherits a 14px card). */
   html, body { touch-action: manipulation; }
-  input, textarea, [contenteditable="true"] {
+  html {
+    -webkit-text-size-adjust: 100% !important;
+    text-size-adjust: 100% !important;
+  }
+  input, textarea, [contenteditable="true"],
+  [data-composer-input],
+  [data-composer-card] [contenteditable] {
     font-size: 16px !important;
+    -webkit-text-size-adjust: 100% !important;
+    text-size-adjust: 100% !important;
     touch-action: manipulation;
   }
+  /* A page that is still magnified reports it here. releaseFocusZoom() centres
+     the field the user is typing into, so the zoom cannot leave them looking
+     at a corner of the page instead of the caret. */
+  html[data-rdsh-focus-zoom] body { overflow: hidden; }
   /* The bundled xterm 6.0 has no touch path and scrolls only on wheel events,
      so the JS bridge owns the gesture. Keep the browser from claiming the drag
      as a pan/zoom before the touchmove handler sees it. (This alone cannot
@@ -11068,6 +11352,16 @@ html[data-rdsh-native-gap][data-rdsh-safe-bottom] #root { padding-bottom: 0 !imp
         // The visual viewport can move without resizing (the browser scrolls a
         // focused field above the keyboard); both events share the rAF fit.
         window.visualViewport?.addEventListener("scroll", onLayoutResize);
+        // A focus zoom changes the visual viewport's width in both of its
+        // phases: the zoom itself and the scrolled-away page after it. Recover
+        // from that on the same two events, before any of the geometry work.
+        const onFocusZoom = () => {
+          if (!phone()) return;
+          releaseFocusZoom();
+          onLayoutResize();
+        };
+        window.visualViewport?.addEventListener("resize", onFocusZoom);
+        window.visualViewport?.addEventListener("scroll", onFocusZoom);
         patchCommandUi(ctx);
         document.addEventListener("dragstart", onDragStartCapture, true);
         document.addEventListener("dragend", onDragEndCapture, true);
